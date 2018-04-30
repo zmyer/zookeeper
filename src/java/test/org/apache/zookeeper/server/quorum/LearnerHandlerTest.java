@@ -24,10 +24,12 @@ import static org.junit.Assert.assertTrue;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
+import java.io.BufferedInputStream;
 import java.io.IOException;
 import java.net.Socket;
 import java.util.Iterator;
 import java.util.LinkedList;
+import java.util.List;
 import java.util.Queue;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
@@ -54,7 +56,7 @@ public class LearnerHandlerTest extends ZKTestCase {
         boolean threadStarted = false;
 
         MockLearnerHandler(Socket sock, Leader leader) throws IOException {
-            super(sock, leader);
+            super(sock, new BufferedInputStream(sock.getInputStream()), leader);
         }
 
         protected void startSendingPackets() {
@@ -90,7 +92,7 @@ public class LearnerHandlerTest extends ZKTestCase {
             return 0;
         }
 
-        public LinkedList<Proposal> getCommittedLog() {
+        public List<Proposal> getCommittedLog() {
             return committedLog;
         }
 

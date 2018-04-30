@@ -16,7 +16,7 @@
  * limitations under the License.
  */
 
-#ifndef DLL_EXPORT
+#if !defined(DLL_EXPORT) && !defined(USE_STATIC_LIB)
 #  define USE_STATIC_LIB
 #endif
 
@@ -24,6 +24,7 @@
 #define USE_IPV6
 #endif
 
+#include "config.h"
 #include <zookeeper.h>
 #include <zookeeper.jute.h>
 #include <proto.h>
@@ -41,18 +42,33 @@
 #include <stdarg.h>
 #include <limits.h>
 
-#ifndef _WIN32
+#ifdef HAVE_SYS_TIME_H
 #include <sys/time.h>
+#endif
+
+#ifdef HAVE_SYS_SOCKET_H
 #include <sys/socket.h>
+#endif
+
+#ifdef HAVE_POLL
 #include <poll.h>
+#endif
+
+#ifdef HAVE_NETINET_IN_H
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#endif
+
+#ifdef HAVE_ARPA_INET_H
 #include <arpa/inet.h>
+#endif
+
+#ifdef HAVE_NETDB_H
 #include <netdb.h>
+#endif
+
+#ifdef HAVE_UNISTD_H
 #include <unistd.h> // needed for _POSIX_MONOTONIC_CLOCK
-#include "config.h"
-#else
-#include "winstdint.h"
 #endif
 
 #ifdef HAVE_SYS_UTSNAME_H
@@ -66,6 +82,14 @@
 #ifdef __MACH__ // OS X
 #include <mach/clock.h>
 #include <mach/mach.h>
+#endif
+
+#ifdef WIN32
+#include <process.h> /* for getpid */
+#include <direct.h> /* for getcwd */
+#define EAI_ADDRFAMILY WSAEINVAL /* is this still needed? */
+#define EHOSTDOWN EPIPE
+#define ESTALE ENODEV
 #endif
 
 #define IF_DEBUG(x) if(logLevel==ZOO_LOG_LEVEL_DEBUG) {x;}
@@ -1676,7 +1700,7 @@ void free_completions(zhandle_t *zh,int callCompletion,int reason)
 
         get_auth_completions(&zh->auth_h, &a_list);
         zoo_unlock_auth(zh);
-    
+
         a_tmp = &a_list;
         // chain call user's completion function
         while (a_tmp->completion != NULL) {
@@ -2063,10 +2087,16 @@ static int ping_rw_server(zhandle_t* zh)
     socket_t sock;
     int rc;
     sendsize_t ssize;
+    int sock_flags;
 
     addrvec_peek(&zh->addrs, &zh->addr_rw_server);
 
-    sock = socket(zh->addr_rw_server.ss_family, SOCK_STREAM, 0);
+#ifdef SOCK_CLOEXEC_ENABLED
+    sock_flags = SOCK_STREAM | SOCK_CLOEXEC;
+#else
+    sock_flags = SOCK_STREAM;
+#endif
+    sock = socket(zh->addr_rw_server.ss_family, sock_flags, 0);
     if (sock < 0) {
         return 0;
     }
@@ -2100,10 +2130,12 @@ out:
     return rc;
 }
 
+#if !defined(WIN32) && !defined(min)
 static inline int min(int a, int b)
 {
     return a < b ? a : b;
 }
+#endif
 
 static void zookeeper_set_sock_noblock(zhandle_t *zh, socket_t sock)
 {
@@ -2167,7 +2199,16 @@ static socket_t zookeeper_connect(zhandle_t *zh,
     rc = connect(fd, (struct sockaddr *)addr, addr_len);
 
 #ifdef _WIN32
-    get_errno();
+    errno = GetLastError();
+
+#ifndef EWOULDBLOCK
+#define EWOULDBLOCK WSAEWOULDBLOCK
+#endif
+
+#ifndef EINPROGRESS
+#define EINPROGRESS WSAEINPROGRESS
+#endif
+
 #if _MSC_VER >= 1600
     switch(errno) {
     case WSAEWOULDBLOCK:
@@ -2186,8 +2227,16 @@ static socket_t zookeeper_connect(zhandle_t *zh,
 int zookeeper_interest(zhandle_t *zh, socket_t *fd, int *interest,
      struct timeval *tv)
 {
+    int sock_flags;
     int rc = 0;
     struct timeval now;
+
+#ifdef SOCK_CLOEXEC_ENABLED
+    sock_flags = SOCK_STREAM | SOCK_CLOEXEC;
+#else
+    sock_flags = SOCK_STREAM;
+#endif
+
     if(zh==0 || fd==0 ||interest==0 || tv==0)
         return ZBADARGUMENTS;
     if (is_unrecoverable(zh))
@@ -2237,7 +2286,7 @@ int zookeeper_interest(zhandle_t *zh, socket_t *fd, int *interest,
                 // No need to delay -- grab the next server and attempt connection
                 zoo_cycle_next_server(zh);
             }
-            zh->fd = socket(zh->addr_cur.ss_family, SOCK_STREAM, 0);
+            zh->fd = socket(zh->addr_cur.ss_family, sock_flags, 0);
             if (zh->fd < 0) {
               rc = handle_socket_error_msg(zh,
                                            __LINE__,
@@ -2572,7 +2621,7 @@ static int deserialize_multi(zhandle_t *zh, int xid, completion_list_t *cptr, st
 
         deserialize_response(zh, entry->c.type, xid, mhdr.type == -1, mhdr.err, entry, ia);
         deserialize_MultiHeader(ia, "multiheader", &mhdr);
-        //While deserializing the response we must destroy completion entry for each operation in 
+        //While deserializing the response we must destroy completion entry for each operation in
         //the zoo_multi transaction. Otherwise this results in memory leak when client invokes zoo_multi
         //operation.
         destroy_completion_entry(entry);
@@ -2640,6 +2689,7 @@ static void deserialize_response(zhandle_t *zh, int type, int xid, int failed, i
             cptr->c.string_result(rc, 0, cptr->data);
         } else {
             struct CreateResponse res;
+            memset(&res, 0, sizeof(res));
             deserialize_CreateResponse(ia, "reply", &res);
             cptr->c.string_result(rc, res.path, cptr->data);
             deallocate_CreateResponse(&res);
@@ -3488,7 +3538,7 @@ int zoo_acreate(zhandle_t *zh, const char *path, const char *value,
     struct RequestHeader h = {get_xid(), ZOO_CREATE_OP};
     struct CreateRequest req;
 
-    int rc = CreateRequest_init(zh, &req, 
+    int rc = CreateRequest_init(zh, &req,
             path, value, valuelen, acl_entries, flags);
     if (rc != ZOK) {
         return rc;
@@ -3596,7 +3646,7 @@ int zoo_awexists(zhandle_t *zh, const char *path,
     struct oarchive *oa;
     struct RequestHeader h = {get_xid(), ZOO_EXISTS_OP};
     struct ExistsRequest req;
-    int rc = Request_path_watch_init(zh, 0, &req.path, path, 
+    int rc = Request_path_watch_init(zh, 0, &req.path, path,
             &req.watch, watcher != NULL);
     if (rc != ZOK) {
         return rc;
@@ -3630,7 +3680,7 @@ static int zoo_awget_children_(zhandle_t *zh, const char *path,
     struct oarchive *oa;
     struct RequestHeader h = {get_xid(), ZOO_GETCHILDREN_OP};
     struct GetChildrenRequest req ;
-    int rc = Request_path_watch_init(zh, 0, &req.path, path, 
+    int rc = Request_path_watch_init(zh, 0, &req.path, path,
             &req.watch, watcher != NULL);
     if (rc != ZOK) {
         return rc;
@@ -3678,7 +3728,7 @@ static int zoo_awget_children2_(zhandle_t *zh, const char *path,
     struct oarchive *oa;
     struct RequestHeader h = {get_xid(), ZOO_GETCHILDREN2_OP};
     struct GetChildren2Request req ;
-    int rc = Request_path_watch_init(zh, 0, &req.path, path, 
+    int rc = Request_path_watch_init(zh, 0, &req.path, path,
             &req.watch, watcher != NULL);
     if (rc != ZOK) {
         return rc;
@@ -4054,7 +4104,7 @@ void zoo_create_op_init(zoo_op_t *op, const char *path, const char *value,
 }
 
 void zoo_create2_op_init(zoo_op_t *op, const char *path, const char *value,
-        int valuelen,  const struct ACL_vector *acl, int flags, 
+        int valuelen,  const struct ACL_vector *acl, int flags,
         char *path_buffer, int path_buffer_len)
 {
     assert(op);

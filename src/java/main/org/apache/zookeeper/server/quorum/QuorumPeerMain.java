@@ -20,7 +20,9 @@ package org.apache.zookeeper.server.quorum;
 import java.io.IOException;
 
 import javax.management.JMException;
+import javax.security.sasl.SaslException;
 
+import org.apache.yetus.audience.InterfaceAudience;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.apache.zookeeper.jmx.ManagedUtil;
@@ -61,6 +63,7 @@ import org.apache.zookeeper.server.quorum.QuorumPeerConfig.ConfigException;
  * "myid" that contains the server id as an ASCII decimal value.
  *
  */
+@InterfaceAudience.Public
 public class QuorumPeerMain {
     private static final Logger LOG = LoggerFactory.getLogger(QuorumPeerMain.class);
 
@@ -181,6 +184,18 @@ public class QuorumPeerMain {
           quorumPeer.setLearnerType(config.getPeerType());
           quorumPeer.setSyncEnabled(config.getSyncEnabled());
           quorumPeer.setQuorumListenOnAllIPs(config.getQuorumListenOnAllIPs());
+
+          // sets quorum sasl authentication configurations
+          quorumPeer.setQuorumSaslEnabled(config.quorumEnableSasl);
+          if(quorumPeer.isQuorumSaslAuthEnabled()){
+              quorumPeer.setQuorumServerSaslRequired(config.quorumServerRequireSasl);
+              quorumPeer.setQuorumLearnerSaslRequired(config.quorumLearnerRequireSasl);
+              quorumPeer.setQuorumServicePrincipal(config.quorumServicePrincipal);
+              quorumPeer.setQuorumServerLoginContext(config.quorumServerLoginContext);
+              quorumPeer.setQuorumLearnerLoginContext(config.quorumLearnerLoginContext);
+          }
+          quorumPeer.setQuorumCnxnThreadsSize(config.quorumCnxnThreadsSize);
+          quorumPeer.initialize();
           
           quorumPeer.start();
           quorumPeer.join();
@@ -191,7 +206,7 @@ public class QuorumPeerMain {
     }
 
     // @VisibleForTesting
-    protected QuorumPeer getQuorumPeer() {
+    protected QuorumPeer getQuorumPeer() throws SaslException {
         return new QuorumPeer();
     }
 }

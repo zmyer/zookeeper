@@ -24,6 +24,8 @@ import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.LinkedList;
+import java.util.List;
+import java.util.Set;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
 
@@ -106,6 +108,7 @@ public class CommitProcessorConcurrencyTest extends ZKTestCase {
 
                 @Override
                 public void notifyStopping(String threadName, int errorCode) {
+                    Assert.fail("Commit processor crashed " + errorCode);
                 }
             });
         }
@@ -175,8 +178,8 @@ public class CommitProcessorConcurrencyTest extends ZKTestCase {
     public void processAsMuchUncommittedRequestsAsPossibleTest()
             throws Exception {
         final String path = "/testAsMuchAsPossible";
-        LinkedList<Request> shouldBeProcessed = new LinkedList<Request>();
-        HashSet<Request> shouldNotBeProcessed = new HashSet<Request>();
+        List<Request> shouldBeProcessed = new LinkedList<Request>();
+        Set<Request> shouldNotBeProcessed = new HashSet<Request>();
         for (int sessionId = 1; sessionId <= 5; ++sessionId) {
             for (int readReqId = 1; readReqId <= sessionId; ++readReqId) {
                 Request readReq = newRequest(new GetDataRequest(path, false),
@@ -221,8 +224,8 @@ public class CommitProcessorConcurrencyTest extends ZKTestCase {
     public void processAllFollowingUncommittedAfterFirstCommitTest()
             throws Exception {
         final String path = "/testUncommittedFollowingCommited";
-        HashSet<Request> shouldBeInPending = new HashSet<Request>();
-        HashSet<Request> shouldBeProcessedAfterPending = new HashSet<Request>();
+        Set<Request> shouldBeInPending = new HashSet<Request>();
+        Set<Request> shouldBeProcessedAfterPending = new HashSet<Request>();
 
         Request writeReq = newRequest(
                 new CreateRequest(path, new byte[0], Ids.OPEN_ACL_UNSAFE,
@@ -282,7 +285,7 @@ public class CommitProcessorConcurrencyTest extends ZKTestCase {
     public void noStarvationOfNonLocalCommittedRequestsTest() throws Exception {
         final String path = "/noStarvationOfCommittedRequests";
         processor.queuedRequests = new MockRequestsQueue();
-        HashSet<Request> nonLocalCommits = new HashSet<Request>();
+        Set<Request> nonLocalCommits = new HashSet<Request>();
         for (int i = 0; i < 10; i++) {
             Request nonLocalCommitReq = newRequest(
                     new CreateRequest(path, new byte[0], Ids.OPEN_ACL_UNSAFE,
@@ -320,7 +323,7 @@ public class CommitProcessorConcurrencyTest extends ZKTestCase {
                 OpCode.create, 0x3, 1);
         processor.queuedRequests.add(firstCommittedReq);
         processor.committedRequests.add(firstCommittedReq);
-        HashSet<Request> allReads = new HashSet<Request>();
+        Set<Request> allReads = new HashSet<Request>();
 
         // +1 read request to queuedRequests
         Request firstRead = newRequest(new GetDataRequest(path, false),
@@ -335,7 +338,7 @@ public class CommitProcessorConcurrencyTest extends ZKTestCase {
                 OpCode.create, 0x99, 2);
         processor.committedRequests.add(secondCommittedReq);
 
-        HashSet<Request> waitingCommittedRequests = new HashSet<Request>();
+        Set<Request> waitingCommittedRequests = new HashSet<Request>();
         // +99 non local committed requests
         for (int writeReqId = 3; writeReqId < 102; ++writeReqId) {
             Request writeReq = newRequest(
@@ -373,5 +376,130 @@ public class CommitProcessorConcurrencyTest extends ZKTestCase {
             Assert.assertTrue("Processed additional committed request",
                     !processedRequests.contains(r));
         }
+    }
+
+    /**
+     * In the following test, we verify that we can handle the case that we got a commit
+     * of a request we never seen since the session that we just established. This can happen
+     * when a session is just established and there is request waiting to be committed in the
+     * session queue but it sees a commit for a request that belongs to the previous connection.
+     */
+    @Test(timeout = 5000)
+    public void noCrashOnCommittedRequestsOfUnseenRequestTest() throws Exception {
+        final String path = "/noCrash/OnCommittedRequests/OfUnseenRequestTest";
+        final int numberofReads = 10;
+        final int sessionid = 0x123456;
+        final int firstCXid = 0x100;
+        int readReqId = firstCXid;
+        processor.stoppedMainLoop = true;
+        HashSet<Request> localRequests = new HashSet<Request>();
+        // queue the blocking write request to queuedRequests
+        Request firstCommittedReq = newRequest(
+                new CreateRequest(path, new byte[0], Ids.OPEN_ACL_UNSAFE,
+                        CreateMode.PERSISTENT_SEQUENTIAL.toFlag()),
+                OpCode.create, sessionid, readReqId++);
+        processor.queuedRequests.add(firstCommittedReq);
+        localRequests.add(firstCommittedReq);
+
+        // queue read requests to queuedRequests
+        for (; readReqId <= numberofReads+firstCXid; ++readReqId) {
+            Request readReq = newRequest(new GetDataRequest(path, false),
+                    OpCode.getData, sessionid, readReqId);
+            processor.queuedRequests.add(readReq);
+            localRequests.add(readReq);
+        }
+
+        //run once
+        Assert.assertTrue(processor.queuedRequests.containsAll(localRequests));
+        processor.initThreads(defaultSizeOfThreadPool);
+        processor.run();
+        Thread.sleep(1000);
+
+        //We verify that the processor is waiting for the commit
+        Assert.assertTrue(processedRequests.isEmpty());
+
+        // We add a commit that belongs to the same session but with smaller cxid,
+        // i.e., commit of an update from previous connection of this session.
+        Request preSessionCommittedReq = newRequest(
+                new CreateRequest(path, new byte[0], Ids.OPEN_ACL_UNSAFE,
+                        CreateMode.PERSISTENT_SEQUENTIAL.toFlag()),
+                OpCode.create, sessionid, firstCXid - 2);
+        processor.committedRequests.add(preSessionCommittedReq);
+        processor.committedRequests.add(firstCommittedReq);
+        processor.run();
+        Thread.sleep(1000);
+
+        //We verify that the commit processor processed the old commit prior to the newer messages
+        Assert.assertTrue(processedRequests.peek() == preSessionCommittedReq);
+
+        processor.run();
+        Thread.sleep(1000);
+
+        //We verify that the commit processor handle all messages.
+        Assert.assertTrue(processedRequests.containsAll(localRequests));
+    }
+
+    /**
+     * In the following test, we verify if we handle the case in which we get a commit
+     * for a request that has higher Cxid than the one we are waiting. This can happen
+     * when a session connection is lost but there is a request waiting to be committed in the
+     * session queue. However, since the session has moved, new requests can get to
+     * the leader out of order. Hence, the commits can also arrive "out of order" w.r.t. cxid.
+     * We should commit the requests according to the order we receive from the leader, i.e., wait for the relevant commit.
+     */
+    @Test(timeout = 5000)
+    public void noCrashOnOutofOrderCommittedRequestTest() throws Exception {
+        final String path = "/noCrash/OnCommittedRequests/OfUnSeenRequestTest";
+        final int sessionid = 0x123456;
+        final int lastCXid = 0x100;
+        final int numberofReads = 10;
+        int readReqId = lastCXid;
+        processor.stoppedMainLoop = true;
+        HashSet<Request> localRequests = new HashSet<Request>();
+
+        // queue the blocking write request to queuedRequests
+        Request orphanCommittedReq = newRequest(
+                new CreateRequest(path, new byte[0], Ids.OPEN_ACL_UNSAFE,
+                        CreateMode.PERSISTENT_SEQUENTIAL.toFlag()),
+                OpCode.create, sessionid, lastCXid);
+        processor.queuedRequests.add(orphanCommittedReq);
+        localRequests.add(orphanCommittedReq);
+
+        // queue read requests to queuedRequests
+        for (; readReqId <= numberofReads+lastCXid; ++readReqId) {
+            Request readReq = newRequest(new GetDataRequest(path, false),
+                    OpCode.getData, sessionid, readReqId);
+            processor.queuedRequests.add(readReq);
+            localRequests.add(readReq);
+        }
+
+        //run once
+        processor.initThreads(defaultSizeOfThreadPool);
+        processor.run();
+        Thread.sleep(1000);
+
+        //We verify that the processor is waiting for the commit
+        Assert.assertTrue(processedRequests.isEmpty());
+
+        // We add a commit that belongs to the same session but with larger cxid,
+        // i.e., commit of an update from the next connection of this session.
+        Request otherSessionCommittedReq = newRequest(
+                new CreateRequest(path, new byte[0], Ids.OPEN_ACL_UNSAFE,
+                        CreateMode.PERSISTENT_SEQUENTIAL.toFlag()),
+                OpCode.create, sessionid, lastCXid+10);
+        processor.committedRequests.add(otherSessionCommittedReq);
+        processor.committedRequests.add(orphanCommittedReq);
+        processor.run();
+        Thread.sleep(1000);
+
+        //We verify that the commit processor processed the old commit prior to the newer messages
+        Assert.assertTrue(processedRequests.size() == 1);
+        Assert.assertTrue(processedRequests.contains(otherSessionCommittedReq));
+
+        processor.run();
+        Thread.sleep(1000);
+
+        //We verify that the commit processor handle all messages.
+        Assert.assertTrue(processedRequests.containsAll(localRequests));
     }
 }

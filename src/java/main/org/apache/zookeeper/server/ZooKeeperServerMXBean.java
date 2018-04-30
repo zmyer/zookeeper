@@ -125,4 +125,14 @@ public interface ZooKeeperServerMXBean {
      * @return secure client address
      */
     public String getSecureClientAddress();
+
+    /**
+     * Returns the elapsed sync of time of transaction log in milliseconds.
+     */
+    public long getTxnLogElapsedSyncTime();
+
+    /**
+     * @return Returns the value of the following config setting: jute.maxbuffer
+     */
+    public int getJuteMaxBufferSize();
 }

@@ -104,7 +104,7 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
     protected volatile State state = State.INITIAL;
 
     protected enum State {
-        INITIAL, RUNNING, SHUTDOWN, ERROR;
+        INITIAL, RUNNING, SHUTDOWN, ERROR
     }
 
     /**
@@ -116,7 +116,7 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
     private final AtomicInteger requestsInProcess = new AtomicInteger(0);
     final List<ChangeRecord> outstandingChanges = new ArrayList<ChangeRecord>();
     // this data structure must be accessed under the outstandingChanges lock
-    final HashMap<String, ChangeRecord> outstandingChangesForPath =
+    final Map<String, ChangeRecord> outstandingChangesForPath =
         new HashMap<String, ChangeRecord>();
 
     protected ServerCnxnFactory serverCnxnFactory;
@@ -185,11 +185,11 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
         pwriter.print("secureClientPort=");
         pwriter.println(getSecureClientPort());
         pwriter.print("dataDir=");
-        pwriter.println(zkDb.snapLog.getDataDir().getAbsolutePath());
+        pwriter.println(zkDb.snapLog.getSnapDir().getAbsolutePath());
         pwriter.print("dataDirSize=");
         pwriter.println(getDataDirSize());
         pwriter.print("dataLogDir=");
-        pwriter.println(zkDb.snapLog.getSnapDir().getAbsolutePath());
+        pwriter.println(zkDb.snapLog.getDataDir().getAbsolutePath());
         pwriter.print("dataLogSize=");
         pwriter.println(getLogDirSize());
         pwriter.print("tickTime=");
@@ -229,7 +229,7 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
     }
 
     /**
-     * Default constructor, relies on the config for its agrument values
+     * Default constructor, relies on the config for its argument values
      *
      * @throws IOException
      */
@@ -285,7 +285,7 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
         }
         
         // Clean up dead sessions
-        LinkedList<Long> deadSessions = new LinkedList<Long>();
+        List<Long> deadSessions = new LinkedList<Long>();
         for (Long session : zkDb.getSessions()) {
             if (zkDb.getSessionWithTimeOuts().get(session) == null) {
                 deadSessions.add(session);
@@ -301,9 +301,13 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
         takeSnapshot();
     }
 
-    public void takeSnapshot(){
+    public void takeSnapshot() {
+        takeSnapshot(false);
+    }
+
+    public void takeSnapshot(boolean syncSnap){
         try {
-            txnLogFactory.save(zkDb.getDataTree(), zkDb.getSessionWithTimeOuts());
+            txnLogFactory.save(zkDb.getDataTree(), zkDb.getSessionWithTimeOuts(), syncSnap);
         } catch (IOException e) {
             LOG.error("Severe unrecoverable error, exiting", e);
             // This is a severe error that we cannot recover from,
@@ -503,7 +507,7 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
         if (zkShutdownHandler != null) {
             zkShutdownHandler.handle(state);
         } else {
-            LOG.error("ZKShutdownHandler is not registered, so ZooKeeper server "
+            LOG.debug("ZKShutdownHandler is not registered, so ZooKeeper server "
                     + "won't take any action on ERROR or SHUTDOWN server state changes");
         }
     }
@@ -553,14 +557,24 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
             firstProcessor.shutdown();
         }
 
-        if (fullyShutDown && zkDb != null) {
-            zkDb.clear();
+        if (zkDb != null) {
+            if (fullyShutDown) {
+                zkDb.clear();
+            } else {
+                // else there is no need to clear the database
+                //  * When a new quorum is established we can still apply the diff
+                //    on top of the same zkDb data
+                //  * If we fetch a new snapshot from leader, the zkDb will be
+                //    cleared anyway before loading the snapshot
+                try {
+                    //This will fast forward the database to the latest recorded transactions
+                    zkDb.fastForwardDataBase();
+                } catch (IOException e) {
+                    LOG.error("Error updating DB", e);
+                    zkDb.clear();
+                }
+            }
         }
-        // else there is no need to clear the database
-        //  * When a new quorum is established we can still apply the diff
-        //    on top of the same zkDb data
-        //  * If we fetch a new snapshot from leader, the zkDb will be
-        //    cleared anyway before loading the snapshot
 
         unregisterJMX();
     }
@@ -944,6 +958,13 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
         return this.txnLogFactory;
     }
 
+    /**
+     * Returns the elapsed sync of time of transaction log in milliseconds.
+     */
+    public long getTxnLogElapsedSyncTime() {
+        return txnLogFactory.getTxnLogElapsedSyncTime();
+    }
+
     public String getState() {
         return "standalone";
     }
@@ -1092,6 +1113,7 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
                 Record rsp = processSasl(incomingBuffer,cnxn);
                 ReplyHeader rh = new ReplyHeader(h.getXid(), 0, KeeperException.Code.OK.intValue());
                 cnxn.sendResponse(rh,rsp, "response"); // not sure about 3rd arg..what is it?
+                return;
             }
             else {
                 Request si = new Request(cnxn, cnxn.getSessionId(), h.getXid(),
@@ -1124,6 +1146,10 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
                     String authorizationID = saslServer.getAuthorizationID();
                     LOG.info("adding SASL authorization for authorizationID: " + authorizationID);
                     cnxn.addAuthInfo(new Id("sasl",authorizationID));
+                    if (System.getProperty("zookeeper.superUser") != null && 
+                        authorizationID.equals(System.getProperty("zookeeper.superUser"))) {
+                        cnxn.addAuthInfo(new Id("super", ""));
+                    }
                 }
             }
             catch (SaslException e) {

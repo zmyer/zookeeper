@@ -96,12 +96,6 @@ public class TestableZooKeeper extends ZooKeeperAdmin {
             return false;
         }
     }
-    
-    public boolean testableWaitForShutdown(int wait)
-        throws InterruptedException
-    {
-        return super.testableWaitForShutdown(wait);
-    }
 
     public SocketAddress testableLocalSocketAddress() {
         return super.testableLocalSocketAddress();
@@ -121,5 +115,14 @@ public class TestableZooKeeper extends ZooKeeperAdmin {
     public ReplyHeader submitRequest(RequestHeader h, Record request,
             Record response, WatchRegistration watchRegistration) throws InterruptedException {
         return cnxn.submitRequest(h, request, response, watchRegistration);
+    }
+
+    /** Testing only!!! Really!!!! This is only here to test when the client
+     * disconnects from the server w/o sending a session disconnect (ie
+     * ending the session cleanly). The server will eventually notice the
+     * client is no longer pinging and will timeout the session.
+     */
+    public void disconnect() {
+        cnxn.disconnect();
     }
 }

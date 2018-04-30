@@ -163,8 +163,8 @@
       <section id="sc_requiredSoftware">
         <title>Required Software </title>
 
-        <para>ZooKeeper runs in Java, release 1.7 or greater (JDK 7 or
-        greater, FreeBSD support requires openjdk7).  It runs as an
+        <para>ZooKeeper runs in Java, release 1.8 or greater (JDK 8 or
+        greater, FreeBSD support requires openjdk8).  It runs as an
         <emphasis>ensemble</emphasis> of ZooKeeper servers. Three
         ZooKeeper servers is the minimum recommended size for an
         ensemble, and we also recommend that they run on separate
@@ -409,7 +409,7 @@ server.3=zoo3:2888:3888</programlisting>
     <section id="sc_designing">
       <title>Designing a ZooKeeper Deployment</title>
 
-      <para>The reliablity of ZooKeeper rests on two basic assumptions.</para>
+      <para>The reliability of ZooKeeper rests on two basic assumptions.</para>
       <orderedlist>
         <listitem><para> Only a minority of servers in a deployment
             will fail. <emphasis>Failure</emphasis> in this context
@@ -522,10 +522,14 @@ server.3=zoo3:2888:3888</programlisting>
           of the znodes stored by a particular serving ensemble. These
           are the snapshot and transactional log files. As changes are
           made to the znodes these changes are appended to a
-          transaction log, occasionally, when a log grows large, a
+          transaction log. Occasionally, when a log grows large, a
           snapshot of the current state of all znodes will be written
-          to the filesystem. This snapshot supercedes all previous
-          logs.
+          to the filesystem and a new transaction log file is created
+          for future transactions. During snapshotting, ZooKeeper may
+          continue appending incoming transactions to the old log file.
+          Therefore, some transactions which are newer than a snapshot
+          may be found in the last transaction log preceding the
+          snapshot.
         </para>
 
         <para>A ZooKeeper server <emphasis role="bold">will not remove
@@ -769,11 +773,11 @@ server.3=zoo3:2888:3888</programlisting>
               role="bold">dataLogDir</emphasis> rather than the <emphasis
               role="bold">dataDir</emphasis>. This allows a dedicated log
               device to be used, and helps avoid competition between logging
-              and snaphots.</para>
+              and snapshots.</para>
 
               <note>
                 <para>Having a dedicated log device has a large impact on
-                throughput and stable latencies. It is highly recommened to
+                throughput and stable latencies. It is highly recommended to
                 dedicate a log device and set <emphasis
                 role="bold">dataLogDir</emphasis> to point to a directory on
                 that device, and then make sure to point <emphasis
@@ -822,11 +826,15 @@ server.3=zoo3:2888:3888</programlisting>
               <para>(Java system property: <emphasis
               role="bold">zookeeper.snapCount</emphasis>)</para>
 
-              <para>ZooKeeper logs transactions to a transaction
-              log. After snapCount transactions are written to a log
-              file a snapshot is started and a new transaction log
-              file is created. The default snapCount is
-              100,000.</para>
+              <para>ZooKeeper records its transactions using snapshots and
+              a transaction log (think write-ahead log).The number of
+              transactions recorded in the transaction log before a snapshot
+              can be taken (and the transaction log rolled) is determined
+              by snapCount. In order to prevent all of the machines in the quorum
+              from taking a snapshot at the same time, each ZooKeeper server
+              will take a snapshot when the number of transactions in the transaction log
+              reaches a runtime generated random value in the [snapCount/2+1, snapCount] 
+              range.The default snapCount is 100,000.</para>
             </listitem>
           </varlistentry>
 
@@ -958,15 +966,14 @@ server.3=zoo3:2888:3888</programlisting>
             <listitem>
               <para>(No Java system property)</para>
 
-              <para>Election implementation to use. A value of "0" corresponds
-              to the original UDP-based version, "1" corresponds to the
+              <para>Election implementation to use. A value of "1" corresponds to the
               non-authenticated UDP-based version of fast leader election, "2"
               corresponds to the authenticated UDP-based version of fast
               leader election, and "3" corresponds to TCP-based version of
-              fast leader election. Currently, algorithm 3 is the default</para>
+              fast leader election. Currently, algorithm 3 is the default.</para>
               
               <note>
-              <para> The implementations of leader election 0, 1, and 2 are now 
+              <para> The implementations of leader election 1, and 2 are now
               <emphasis role="bold"> deprecated </emphasis>. We have the intention
               of removing them in the next release, at which point only the 
               FastLeaderElection will be available. 
@@ -997,7 +1004,7 @@ server.3=zoo3:2888:3888</programlisting>
 
               <para>Leader accepts client connections. Default value is "yes".
               The leader machine coordinates updates. For higher update
-              throughput at thes slight expense of read throughput the leader
+              throughput at the slight expense of read throughput the leader
               can be configured to not accept clients and focus on
               coordination. The default to this option is yes, which means
               that a leader will accept client connections.</para>
@@ -1029,9 +1036,7 @@ server.3=zoo3:2888:3888</programlisting>
 
               <para>There are two port numbers <emphasis role="bold">nnnnn</emphasis>. 
               The first followers use to connect to the leader, and the second is for 
-              leader election. The leader election port is only necessary if electionAlg 
-              is 1, 2, or 3 (default). If electionAlg is 0, then the second port is not 
-              necessary. If you want to test multiple servers on a single machine, then 
+              leader election. If you want to test multiple servers on a single machine, then
               different ports can be used for each server.</para>
             </listitem>
           </varlistentry>
@@ -1189,6 +1194,29 @@ server.3=zoo3:2888:3888</programlisting>
             </listitem>
           </varlistentry>
 
+          <varlistentry>
+            <term>tcpKeepAlive</term>
+
+            <listitem>
+              <para>(Java system property: <emphasis
+                      role="bold">zookeeper.tcpKeepAlive</emphasis>)</para>
+
+              <para><emphasis role="bold">New in 3.5.4:</emphasis>
+                Setting this to true sets the TCP keepAlive flag on the
+                sockets used by quorum members to perform elections.
+                This will allow for connections between quorum members to
+                remain up when there is network infrastructure that may
+                otherwise break them. Some NATs and firewalls may terminate
+                or lose state for long running or idle connections.</para>
+
+              <para> Enabling this option relies on OS level settings to work
+                properly, check your operating system's options regarding TCP
+                keepalive for more information.  Defaults to
+                <emphasis role="bold">false</emphasis>.
+              </para>
+            </listitem>
+          </varlistentry>
+
         </variablelist>
         <para></para>
       </section>
@@ -1243,6 +1271,19 @@ server.3=zoo3:2888:3888</programlisting>
               When this parameter is set to an X500 principal name, only an
               authenticated client with that principal will be able to bypass
               ACL checking and have full privileges to all znodes.</para>
+            </listitem>
+          </varlistentry>
+
+          <varlistentry>
+            <term>zookeeper.superUser</term>
+            <listitem>
+              <para>(Java system property: <emphasis
+              role="bold">zookeeper.superUser</emphasis>)</para>
+
+              <para>Similar to <emphasis role="bold">zookeeper.X509AuthenticationProvider.superUser</emphasis>
+              but is generic for SASL based logins. It stores the name of 
+              a user that can access the znode hierarchy as a "super" user.
+              </para>
             </listitem>
           </varlistentry>
 
@@ -2076,8 +2117,11 @@ server.3=zoo3:2888:3888</programlisting>
         <para>The Log Directory contains the ZooKeeper transaction logs.
         Before any update takes place, ZooKeeper ensures that the transaction
         that represents the update is written to non-volatile storage. A new
-        log file is started each time a snapshot is begun. The log file's
-        suffix is the first zxid written to that log.</para>
+        log file is started when the number of transactions written to the
+        current log file reaches a (variable) threshold. The threshold is
+        computed using the same parameter which influences the frequency of
+        snapshotting (see snapCount above). The log file's suffix is the first
+        zxid written to that log.</para>
       </section>
 
       <section id="sc_filemanagement">
@@ -2097,8 +2141,12 @@ server.3=zoo3:2888:3888</programlisting>
         <para>The ZooKeeper server creates snapshot and log files, but
         never deletes them. The retention policy of the data and log
         files is implemented outside of the ZooKeeper server. The
-        server itself only needs the latest complete fuzzy snapshot
-        and the log files from the start of that snapshot. See the
+        server itself only needs the latest complete fuzzy snapshot, all log
+        files following it, and the last log file preceding it.  The latter
+        requirement is necessary to include updates which happened after this
+        snapshot was started but went into the existing log file at that time.
+        This is possible because snapshotting and rolling over of logs
+        proceed somewhat independently in ZooKeeper. See the
         <ulink url="#sc_maintenance">maintenance</ulink> section in
         this document for more details on setting a retention policy
         and maintenance of ZooKeeper storage.
@@ -2110,6 +2158,76 @@ server.3=zoo3:2888:3888</programlisting>
         ZooKeeper (e.g., control access to the files) and depend on the
         individual settings in which it is being deployed. </para>
         </note>
+      </section>
+
+      <section>
+        <title>Recovery - TxnLogToolkit</title>
+
+        <para>TxnLogToolkit is a command line tool shipped with ZooKeeper which
+          is capable of recovering transaction log entries with broken CRC.</para>
+        <para>Running it without any command line parameters or with the "-h,--help"
+          argument, it outputs the following help page:</para>
+
+        <programlisting>
+          $ bin/zkTxnLogToolkit.sh
+
+          usage: TxnLogToolkit [-dhrv] txn_log_file_name
+          -d,--dump      Dump mode. Dump all entries of the log file. (this is the default)
+          -h,--help      Print help message
+          -r,--recover   Recovery mode. Re-calculate CRC for broken entries.
+          -v,--verbose   Be verbose in recovery mode: print all entries, not just fixed ones.
+          -y,--yes       Non-interactive mode: repair all CRC errors without asking
+        </programlisting>
+
+        <para>The default behaviour is safe: it dumps the entries of the given
+        transaction log file to the screen: (same as using '-d,--dump' parameter)</para>
+
+        <programlisting>
+          $ bin/zkTxnLogToolkit.sh log.100000001
+          ZooKeeper Transactional Log File with dbid 0 txnlog format version 2
+          4/5/18 2:15:58 PM CEST session 0x16295bafcc40000 cxid 0x0 zxid 0x100000001 createSession 30000
+          <emphasis role="bold">CRC ERROR - 4/5/18 2:16:05 PM CEST session 0x16295bafcc40000 cxid 0x1 zxid 0x100000002 closeSession null</emphasis>
+          4/5/18 2:16:05 PM CEST session 0x16295bafcc40000 cxid 0x1 zxid 0x100000002 closeSession null
+          4/5/18 2:16:12 PM CEST session 0x26295bafcc90000 cxid 0x0 zxid 0x100000003 createSession 30000
+          4/5/18 2:17:34 PM CEST session 0x26295bafcc90000 cxid 0x0 zxid 0x200000001 closeSession null
+          4/5/18 2:17:34 PM CEST session 0x16295bd23720000 cxid 0x0 zxid 0x200000002 createSession 30000
+          4/5/18 2:18:02 PM CEST session 0x16295bd23720000 cxid 0x2 zxid 0x200000003 create '/andor,#626262,v{s{31,s{'world,'anyone}}},F,1
+          EOF reached after 6 txns.
+        </programlisting>
+
+        <para>There's a CRC error in the 2nd entry of the above transaction log file. In <emphasis role="bold">dump</emphasis>
+          mode, the toolkit only prints this information to the screen without touching the original file. In
+          <emphasis role="bold">recovery</emphasis> mode (-r,--recover flag) the original file still remains
+          untouched and all transactions will be copied over to a new txn log file with ".fixed" suffix. It recalculates
+          CRC values and copies the calculated value, if it doesn't match the original txn entry.
+          By default, the tool works interactively: it asks for confirmation whenever CRC error encountered.</para>
+
+        <programlisting>
+          $ bin/zkTxnLogToolkit.sh -r log.100000001
+          ZooKeeper Transactional Log File with dbid 0 txnlog format version 2
+          CRC ERROR - 4/5/18 2:16:05 PM CEST session 0x16295bafcc40000 cxid 0x1 zxid 0x100000002 closeSession null
+          Would you like to fix it (Yes/No/Abort) ?
+        </programlisting>
+
+        <para>Answering <emphasis role="bold">Yes</emphasis> means the newly calculated CRC value will be outputted
+          to the new file. <emphasis role="bold">No</emphasis> means that the original CRC value will be copied over.
+          <emphasis role="bold">Abort</emphasis> will abort the entire operation and exits.
+          (In this case the ".fixed" will not be deleted and left in a half-complete state: contains only entries which
+          have already been processed or only the header if the operation was aborted at the first entry.)</para>
+
+        <programlisting>
+          $ bin/zkTxnLogToolkit.sh -r log.100000001
+          ZooKeeper Transactional Log File with dbid 0 txnlog format version 2
+          CRC ERROR - 4/5/18 2:16:05 PM CEST session 0x16295bafcc40000 cxid 0x1 zxid 0x100000002 closeSession null
+          Would you like to fix it (Yes/No/Abort) ? y
+          EOF reached after 6 txns.
+          Recovery file log.100000001.fixed has been written with 1 fixed CRC error(s)
+        </programlisting>
+
+        <para>The default behaviour of recovery is to be silent: only entries with CRC error get printed to the screen.
+          One can turn on verbose mode with the -v,--verbose parameter to see all records.
+          Interactive mode can be turned off with the -y,--yes parameter. In this case all CRC errors will be fixed
+          in the new transaction file.</para>
       </section>
     </section>
 
@@ -2188,7 +2306,7 @@ server.3=zoo3:2888:3888</programlisting>
       Zookeeper practices:</para>
 
 
-      <para>For multi-tennant installations see the <ulink
+      <para>For multi-tenant installations see the <ulink
       url="zookeeperProgrammers.html#ch_zkSessions">section</ulink>
       detailing ZooKeeper "chroot" support, this can be very useful
       when deploying many applications/services interfacing to a

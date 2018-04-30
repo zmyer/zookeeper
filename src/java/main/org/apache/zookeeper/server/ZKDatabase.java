@@ -18,7 +18,7 @@
 
 package org.apache.zookeeper.server;
 
-import java.io.ByteArrayOutputStream;
+import java.io.File;
 import java.io.IOException;
 import java.io.PrintWriter;
 import java.util.Collection;
@@ -32,7 +32,6 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock.ReadLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock.WriteLock;
 
-import org.apache.jute.BinaryOutputArchive;
 import org.apache.jute.InputArchive;
 import org.apache.jute.OutputArchive;
 import org.apache.jute.Record;
@@ -75,13 +74,14 @@ public class ZKDatabase {
     protected ConcurrentHashMap<Long, Integer> sessionsWithTimeouts;
     protected FileTxnSnapLog snapLog;
     protected long minCommittedLog, maxCommittedLog;
-    
+
     /**
      * Default value is to use snapshot if txnlog size exceeds 1/3 the size of snapshot
      */
     public static final String SNAPSHOT_SIZE_FACTOR = "zookeeper.snapshotSizeFactor";
-    private double snapshotSizeFactor = 0.33;
-    
+    public static final double DEFAULT_SNAPSHOT_SIZE_FACTOR = 0.33;
+    private double snapshotSizeFactor;
+
     public static final int commitLogCount = 500;
     protected static int commitLogBuffer = 700;
     protected LinkedList<Proposal> committedLog = new LinkedList<Proposal>();
@@ -98,6 +98,23 @@ public class ZKDatabase {
         dataTree = new DataTree();
         sessionsWithTimeouts = new ConcurrentHashMap<Long, Integer>();
         this.snapLog = snapLog;
+
+        try {
+            snapshotSizeFactor = Double.parseDouble(
+                System.getProperty(SNAPSHOT_SIZE_FACTOR,
+                        Double.toString(DEFAULT_SNAPSHOT_SIZE_FACTOR)));
+            if (snapshotSizeFactor > 1) {
+                snapshotSizeFactor = DEFAULT_SNAPSHOT_SIZE_FACTOR;
+                LOG.warn("The configured {} is invalid, going to use " +
+                        "the default {}", SNAPSHOT_SIZE_FACTOR,
+                        DEFAULT_SNAPSHOT_SIZE_FACTOR);
+            }
+        } catch (NumberFormatException e) {
+            LOG.error("Error parsing {}, using default value {}",
+                    SNAPSHOT_SIZE_FACTOR, DEFAULT_SNAPSHOT_SIZE_FACTOR);
+            snapshotSizeFactor = DEFAULT_SNAPSHOT_SIZE_FACTOR;
+        }
+        LOG.info("{} = {}", SNAPSHOT_SIZE_FACTOR, snapshotSizeFactor);
     }
 
     /**
@@ -207,6 +224,11 @@ public class ZKDatabase {
         return sessionsWithTimeouts;
     }
 
+    private final PlayBackListener commitProposalPlaybackListener = new PlayBackListener() {
+        public void onTxnLoaded(TxnHeader hdr, Record txn){
+            addCommittedProposal(hdr, txn);
+        }
+    };
 
     /**
      * load the database from the disk onto memory and also add
@@ -215,16 +237,25 @@ public class ZKDatabase {
      * @throws IOException
      */
     public long loadDataBase() throws IOException {
-        PlayBackListener listener=new PlayBackListener(){
-            public void onTxnLoaded(TxnHeader hdr,Record txn){
-                Request r = new Request(0, hdr.getCxid(),hdr.getType(), hdr, txn, hdr.getZxid());
-                addCommittedProposal(r);
-            }
-        };
-
-        long zxid = snapLog.restore(dataTree,sessionsWithTimeouts,listener);
+        long zxid = snapLog.restore(dataTree, sessionsWithTimeouts, commitProposalPlaybackListener);
         initialized = true;
         return zxid;
+    }
+
+    /**
+     * Fast forward the database adding transactions from the committed log into memory.
+     * @return the last valid zxid.
+     * @throws IOException
+     */
+    public long fastForwardDataBase() throws IOException {
+        long zxid = snapLog.fastForwardFromEdits(dataTree, sessionsWithTimeouts, commitProposalPlaybackListener);
+        initialized = true;
+        return zxid;
+    }
+
+    private void addCommittedProposal(TxnHeader hdr, Record txn) {
+        Request r = new Request(0, hdr.getCxid(), hdr.getType(), hdr, txn, hdr.getZxid());
+        addCommittedProposal(r);
     }
 
     /**
@@ -246,19 +277,8 @@ public class ZKDatabase {
                 maxCommittedLog = request.zxid;
             }
 
-            ByteArrayOutputStream baos = new ByteArrayOutputStream();
-            BinaryOutputArchive boa = BinaryOutputArchive.getArchive(baos);
-            try {
-                request.getHdr().serialize(boa, "hdr");
-                if (request.getTxn() != null) {
-                    request.getTxn().serialize(boa, "txn");
-                }
-                baos.close();
-            } catch (IOException e) {
-                LOG.error("This really should be impossible", e);
-            }
-            QuorumPacket pp = new QuorumPacket(Leader.PROPOSAL, request.zxid,
-                    baos.toByteArray(), null);
+            byte[] data = SerializeUtils.serializeRequest(request);
+            QuorumPacket pp = new QuorumPacket(Leader.PROPOSAL, request.zxid, data, null);
             Proposal p = new Proposal();
             p.packet = pp;
             p.request = request;
@@ -268,15 +288,25 @@ public class ZKDatabase {
             wl.unlock();
         }
     }
-    
-    public double getSnapshotSizeFactor() {
-        return snapshotSizeFactor;
+
+    public boolean isTxnLogSyncEnabled() {
+        boolean enabled = snapshotSizeFactor >= 0;
+        if (enabled) {
+            LOG.info("On disk txn sync enabled with snapshotSizeFactor "
+                + snapshotSizeFactor);
+        } else {
+            LOG.info("On disk txn sync disabled");
+        }
+        return enabled;
     }
 
     public long calculateTxnLogSizeLimit() {
         long snapSize = 0;
         try {
-            snapSize = snapLog.findMostRecentSnapshot().length();
+            File snapFile = snapLog.findMostRecentSnapshot();
+            if (snapFile != null) {
+                snapSize = snapFile.length();
+            }
         } catch (IOException e) {
             LOG.error("Unable to get size of most recent snapshot");
         }
@@ -570,7 +600,7 @@ public class ZKDatabase {
         try {
             if (this.dataTree.getNode(ZooDefs.CONFIG_NODE) == null) {
                 // should only happen during upgrade
-                LOG.warn("configuration znode missing (hould only happen during upgrade), creating the node");
+                LOG.warn("configuration znode missing (should only happen during upgrade), creating the node");
                 this.dataTree.addConfigNode();
             }
             this.dataTree.setData(ZooDefs.CONFIG_NODE, qv.toString().getBytes(), -1, qv.getVersion(), Time.currentWallTime());
@@ -578,7 +608,7 @@ public class ZKDatabase {
             System.out.println("configuration node missing - should not happen");
         }
     }
- 
+
     /**
      * Use for unit testing, so we can turn this feature on/off
      * @param snapshotSizeFactor Set to minus value to turn this off.
@@ -603,7 +633,7 @@ public class ZKDatabase {
 
     /**
      * Remove watch from the datatree
-     * 
+     *
      * @param path
      *            node to remove watches from
      * @param type

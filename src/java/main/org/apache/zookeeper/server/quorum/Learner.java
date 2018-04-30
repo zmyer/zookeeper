@@ -50,6 +50,8 @@ import org.apache.zookeeper.server.util.SerializeUtils;
 import org.apache.zookeeper.server.util.ZxidUtils;
 import org.apache.zookeeper.txn.SetDataTxn;
 import org.apache.zookeeper.txn.TxnHeader;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * This class is the superclass of two of the three main actors in a ZK
@@ -193,21 +195,21 @@ public class Learner {
     /**
      * Returns the address of the node we think is the leader.
      */
-    protected InetSocketAddress findLeader() {
-        InetSocketAddress addr = null;
+    protected QuorumServer findLeader() {
+        QuorumServer leaderServer = null;
         // Find the leader by id
         Vote current = self.getCurrentVote();
         for (QuorumServer s : self.getView().values()) {
             if (s.id == current.getId()) {
-                addr = s.addr;
+                leaderServer = s;
                 break;
             }
         }
-        if (addr == null) {
+        if (leaderServer == null) {
             LOG.warn("Couldn't find the leader with id = "
                     + current.getId());
         }
-        return addr;
+        return leaderServer;
     }
    
     /**
@@ -232,10 +234,11 @@ public class Learner {
      * until either initLimit time has elapsed or 5 tries have happened. 
      * @param addr - the address of the Leader to connect to.
      * @throws IOException - if the socket connection fails on the 5th attempt
+     * <li>if there is an authentication failure while connecting to leader</li>
      * @throws ConnectException
      * @throws InterruptedException
      */
-    protected void connectToLeader(InetSocketAddress addr) 
+    protected void connectToLeader(InetSocketAddress addr, String hostname)
     throws IOException, ConnectException, InterruptedException {
         sock = new Socket();        
         sock.setSoTimeout(self.tickTime * self.initLimit);
@@ -279,6 +282,9 @@ public class Learner {
             }
             Thread.sleep(1000);
         }
+
+        self.authLearner.authenticate(sock, hostname);
+
         leaderIs = BinaryInputArchive.getArchive(new BufferedInputStream(
                 sock.getInputStream()));
         bufferedOutput = new BufferedOutputStream(sock.getOutputStream());
@@ -361,6 +367,7 @@ public class Learner {
         // In the DIFF case we don't need to do a snapshot because the transactions will sync on top of any existing snapshot
         // For SNAP and TRUNC the snapshot is needed to save that history
         boolean snapshotNeeded = true;
+        boolean syncSnapshot = false;
         readPacket(qp);
         LinkedList<Long> packetsCommitted = new LinkedList<Long>();
         LinkedList<PacketInFlight> packetsNotCommitted = new LinkedList<PacketInFlight>();
@@ -370,15 +377,26 @@ public class Learner {
                 snapshotNeeded = false;
             }
             else if (qp.getType() == Leader.SNAP) {
-                LOG.info("Getting a snapshot from leader");
+                LOG.info("Getting a snapshot from leader 0x" + Long.toHexString(qp.getZxid()));
                 // The leader is going to dump the database
                 // db is clear as part of deserializeSnapshot()
                 zk.getZKDatabase().deserializeSnapshot(leaderIs);
+                // ZOOKEEPER-2819: overwrite config node content extracted
+                // from leader snapshot with local config, to avoid potential
+                // inconsistency of config node content during rolling restart.
+                if (!QuorumPeerConfig.isReconfigEnabled()) {
+                    LOG.debug("Reset config node content from local config after deserialization of snapshot.");
+                    zk.getZKDatabase().initConfigInZKDatabase(self.getQuorumVerifier());
+                }
                 String signature = leaderIs.readString("signature");
                 if (!signature.equals("BenWasHere")) {
                     LOG.error("Missing signature. Got " + signature);
                     throw new IOException("Missing signature");                   
                 }
+                zk.getZKDatabase().setlastProcessedZxid(qp.getZxid());
+
+                // immediately persist the latest snapshot when there is txn log gap
+                syncSnapshot = true;
             } else if (qp.getType() == Leader.TRUNC) {
                 //we need to truncate the log to the lastzxid of the leader
                 LOG.warn("Truncating log to get in sync with the leader 0x"
@@ -390,6 +408,7 @@ public class Learner {
                             + Long.toHexString(qp.getZxid()));
                     System.exit(13);
                 }
+                zk.getZKDatabase().setlastProcessedZxid(qp.getZxid());
 
             }
             else {
@@ -399,7 +418,6 @@ public class Learner {
 
             }
             zk.getZKDatabase().initConfigInZKDatabase(self.getQuorumVerifier());
-            zk.getZKDatabase().setlastProcessedZxid(qp.getZxid());
             zk.createSessionTracker();            
             
             long lastQueued = 0;
@@ -505,7 +523,7 @@ public class Learner {
                        }
                     }
                     if (isPreZAB1_0) {
-                        zk.takeSnapshot();
+                        zk.takeSnapshot(syncSnapshot);
                         self.setCurrentEpoch(newEpoch);
                     }
                     self.setZooKeeperServer(zk);
@@ -525,7 +543,7 @@ public class Learner {
                    }
 
                    if (snapshotNeeded) {
-                       zk.takeSnapshot();
+                       zk.takeSnapshot(syncSnapshot);
                    }
                    
                     self.setCurrentEpoch(newEpoch);

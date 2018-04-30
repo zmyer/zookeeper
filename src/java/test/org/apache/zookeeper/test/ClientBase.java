@@ -56,6 +56,7 @@ import org.apache.zookeeper.server.ServerCnxnFactory;
 import org.apache.zookeeper.server.ServerCnxnFactoryAccessor;
 import org.apache.zookeeper.server.ZKDatabase;
 import org.apache.zookeeper.server.ZooKeeperServer;
+import org.apache.zookeeper.server.persistence.FilePadding;
 import org.apache.zookeeper.server.persistence.FileTxnLog;
 import org.apache.zookeeper.server.quorum.QuorumPeer;
 import org.apache.zookeeper.server.util.OSMXBean;
@@ -100,6 +101,8 @@ public abstract class ClientBase extends ZKTestCase {
         volatile boolean connected;
         // Set to true when connected to a quorum server.
         volatile boolean syncConnected;
+        // Set to true when connected to a quorum server in read-only mode
+        volatile boolean readOnlyConnected;
 
         public CountdownWatcher() {
             reset();
@@ -108,18 +111,22 @@ public abstract class ClientBase extends ZKTestCase {
             clientConnected = new CountDownLatch(1);
             connected = false;
             syncConnected = false;
+            readOnlyConnected = false;
         }
         synchronized public void process(WatchedEvent event) {
             KeeperState state = event.getState();
             if (state == KeeperState.SyncConnected) {
                 connected = true;
                 syncConnected = true;
+                readOnlyConnected = false;
             } else if (state == KeeperState.ConnectedReadOnly) {
                 connected = true;
                 syncConnected = false;
+                readOnlyConnected = true;
             } else {
                 connected = false;
                 syncConnected = false;
+                readOnlyConnected = false;
             }
 
             notifyAll();
@@ -157,6 +164,19 @@ public abstract class ClientBase extends ZKTestCase {
                 throw new TimeoutException("Failed to connect to read-write ZooKeeper server.");
             }
         }
+        synchronized public void waitForReadOnlyConnected(long timeout)
+                throws InterruptedException, TimeoutException
+        {
+            long expire = System.currentTimeMillis() + timeout;
+            long left = timeout;
+            while(!readOnlyConnected && left > 0) {
+                wait(left);
+                left = expire - System.currentTimeMillis();
+            }
+            if (!readOnlyConnected) {
+                throw new TimeoutException("Failed to connect in read-only mode to ZooKeeper server.");
+            }
+        }
         synchronized public void waitForDisconnected(long timeout)
             throws InterruptedException, TimeoutException
         {
@@ -192,7 +212,7 @@ public abstract class ClientBase extends ZKTestCase {
         return createClient(watcher, hostPort);
     }
 
-    private LinkedList<ZooKeeper> allClients;
+    private List<ZooKeeper> allClients;
     private boolean allClientsSetup = false;
 
     protected TestableZooKeeper createClient(CountdownWatcher watcher, String hp)
@@ -466,7 +486,7 @@ public abstract class ClientBase extends ZKTestCase {
         // resulting in test Assert.failure (client timeout on first session).
         // set env and directly in order to handle static init/gc issues
         System.setProperty("zookeeper.preAllocSize", "100");
-        FileTxnLog.setPreallocSize(100 * 1024);
+        FilePadding.setPreallocSize(100 * 1024);
     }
 
     protected void setUpAll() throws Exception {

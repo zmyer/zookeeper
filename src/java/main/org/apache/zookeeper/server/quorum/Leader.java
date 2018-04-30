@@ -19,6 +19,7 @@
 package org.apache.zookeeper.server.quorum;
 
 import java.io.ByteArrayOutputStream;
+import java.io.BufferedInputStream;
 import java.io.IOException;
 import java.net.BindException;
 import java.net.ServerSocket;
@@ -32,11 +33,14 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ConcurrentMap;
+
+import javax.security.sasl.SaslException;
 
 import org.apache.jute.BinaryOutputArchive;
 import org.apache.zookeeper.ZooDefs.OpCode;
@@ -47,6 +51,7 @@ import org.apache.zookeeper.server.RequestProcessor;
 import org.apache.zookeeper.server.ZooKeeperCriticalThread;
 import org.apache.zookeeper.server.quorum.QuorumPeer.LearnerType;
 import org.apache.zookeeper.server.quorum.flexible.QuorumVerifier;
+import org.apache.zookeeper.server.util.SerializeUtils;
 import org.apache.zookeeper.server.util.ZxidUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -101,6 +106,12 @@ public class Leader {
     private final HashSet<LearnerHandler> learners =
         new HashSet<LearnerHandler>();
 
+    private final ProposalStats proposalStats;
+
+    public ProposalStats getProposalStats() {
+        return proposalStats;
+    }
+
     /**
      * Returns a copy of the current learner snapshot
      */
@@ -148,7 +159,7 @@ public class Leader {
     }
 
     // Pending sync requests. Must access under 'this' lock.
-    private final HashMap<Long,List<LearnerSyncRequest>> pendingSyncs =
+    private final Map<Long,List<LearnerSyncRequest>> pendingSyncs =
         new HashMap<Long,List<LearnerSyncRequest>>();
 
     synchronized public int getNumPendingSyncs() {
@@ -218,6 +229,7 @@ public class Leader {
 
     Leader(QuorumPeer self,LeaderZooKeeperServer zk) throws IOException {
         this.self = self;
+        this.proposalStats = new ProposalStats();
         try {
             if (self.getQuorumListenOnAllIPs()) {
                 ss = new ServerSocket(self.getQuorumAddress().getPort());
@@ -366,7 +378,10 @@ public class Leader {
                         // in LearnerHandler switch to the syncLimit
                         s.setSoTimeout(self.tickTime * self.initLimit);
                         s.setTcpNoDelay(nodelay);
-                        LearnerHandler fh = new LearnerHandler(s, Leader.this);
+
+                        BufferedInputStream is = new BufferedInputStream(
+                                s.getInputStream());
+                        LearnerHandler fh = new LearnerHandler(s, is, Leader.this);
                         fh.start();
                     } catch (SocketException e) {
                         if (stop) {
@@ -380,6 +395,8 @@ public class Leader {
                         } else {
                             throw e;
                         }
+                    } catch (SaslException e){
+                        LOG.error("Exception while connecting to quorum learner", e);
                     }
                 }
             } catch (Exception e) {
@@ -712,7 +729,6 @@ public class Leader {
 
     /**
      * @return True if committed, otherwise false.
-     * @param a proposal p
      **/
     synchronized public boolean tryToCommit(Proposal p, long zxid, SocketAddress followerAddr) {       
        // make sure that ops are committed in order. With reconfigurations it is now possible
@@ -724,7 +740,9 @@ public class Leader {
        // concurrent reconfigs are allowed, this can happen.
        if (outstandingProposals.containsKey(zxid - 1)) return false;
        
-       // getting a quorum from all necessary configurations
+       // in order to be committed, a proposal must be accepted by a quorum.
+       //
+       // getting a quorum from all necessary configurations.
         if (!p.hasAllQuorums()) {
            return false;                 
         }
@@ -736,8 +754,6 @@ public class Leader {
             LOG.warn("First is "
                     + (lastCommitted+1));
         }     
-        
-        // in order to be committed, a proposal must be accepted by a quorum              
         
         outstandingProposals.remove(zxid);
         
@@ -983,8 +999,6 @@ public class Leader {
 
     /**
      * Create an inform packet and send it to all observers.
-     * @param zxid
-     * @param proposal
      */
     public void inform(Proposal proposal) {
         QuorumPacket qp = new QuorumPacket(Leader.INFORM, proposal.request.zxid,
@@ -995,8 +1009,6 @@ public class Leader {
     
     /**
      * Create an inform&activate packet and send it to all observers.
-     * @param zxid
-     * @param proposal
      */
     public void informAndActivate(Proposal proposal, long designatedLeader) {
        byte[] proposalData = proposal.packet.getData();
@@ -1046,19 +1058,9 @@ public class Leader {
             throw new XidRolloverException(msg);
         }
 
-        ByteArrayOutputStream baos = new ByteArrayOutputStream();
-        BinaryOutputArchive boa = BinaryOutputArchive.getArchive(baos);
-        try {
-            request.getHdr().serialize(boa, "hdr");
-            if (request.getTxn() != null) {
-                request.getTxn().serialize(boa, "txn");
-            }
-            baos.close();
-        } catch (IOException e) {
-            LOG.warn("This really should be impossible", e);
-        }
-        QuorumPacket pp = new QuorumPacket(Leader.PROPOSAL, request.zxid,
-                baos.toByteArray(), null);
+        byte[] data = SerializeUtils.serializeRequest(request);
+        proposalStats.setLastProposalSize(data.length);
+        QuorumPacket pp = new QuorumPacket(Leader.PROPOSAL, request.zxid, data, null);
 
         Proposal p = new Proposal();
         p.packet = pp;
@@ -1111,11 +1113,7 @@ public class Leader {
 
     /**
      * Sends a sync message to the appropriate server
-     *
-     * @param f
-     * @param r
      */
-
     public void sendSync(LearnerSyncRequest r){
         QuorumPacket qp = new QuorumPacket(Leader.SYNC, 0, null, null);
         r.fh.queuePacket(qp);

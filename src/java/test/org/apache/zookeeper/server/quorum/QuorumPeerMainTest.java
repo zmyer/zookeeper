@@ -27,16 +27,19 @@ import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.nio.channels.SocketChannel;
+import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.TimeoutException;
 import java.util.regex.Pattern;
 
-import org.apache.log4j.Layout;
 import org.apache.log4j.Level;
 import org.apache.log4j.Logger;
+import org.apache.log4j.PatternLayout;
 import org.apache.log4j.WriterAppender;
 import org.apache.zookeeper.CreateMode;
 import org.apache.zookeeper.KeeperException;
 import org.apache.zookeeper.PortAssignment;
+import org.apache.zookeeper.Watcher;
 import org.apache.zookeeper.ZooDefs.OpCode;
 import org.apache.zookeeper.ZooKeeper;
 import org.apache.zookeeper.ZooDefs.Ids;
@@ -247,14 +250,7 @@ public class QuorumPeerMainTest extends QuorumPeerTestBase {
         numServers = 3;
         servers = LaunchServers(numServers);
         String path = "/hzxidtest";
-        int leader = -1;
-
-        // find the leader
-        for (int i = 0; i < numServers; i++) {
-            if (servers.mt[i].main.quorumPeer.leader != null) {
-                leader = i;
-            }
-        }
+        int leader = servers.findLeader();
 
         // make sure there is a leader
         Assert.assertTrue("There should be a leader", leader >= 0);
@@ -335,14 +331,105 @@ public class QuorumPeerMainTest extends QuorumPeerTestBase {
                 output[0], 2);
     }
 
+    /**
+     * This test validates that if a quorum member determines that it is leader without the support of the rest of the
+     * quorum (the other members do not believe it to be the leader) it will stop attempting to lead and become a follower.
+     *
+     * @throws IOException
+     * @throws InterruptedException
+     */
+    @Test
+    public void testElectionFraud() throws IOException, InterruptedException {
+        // capture QuorumPeer logging
+        ByteArrayOutputStream os = new ByteArrayOutputStream();
+        WriterAppender appender = getConsoleAppender(os, Level.INFO);
+        Logger qlogger = Logger.getLogger(QuorumPeer.class);
+        qlogger.addAppender(appender);
+
+        numServers = 3;
+
+        // used for assertions later
+        boolean foundLeading = false;
+        boolean foundLooking = false;
+        boolean foundFollowing = false;
+
+        try {
+          // spin up a quorum, we use a small ticktime to make the test run faster
+          servers = LaunchServers(numServers, 500);
+
+          // find the leader
+          int trueLeader = servers.findLeader();
+          Assert.assertTrue("There should be a leader", trueLeader >= 0);
+
+          // find a follower
+          int falseLeader = (trueLeader + 1) % numServers;
+          Assert.assertTrue("All servers should join the quorum", servers.mt[falseLeader].main.quorumPeer.follower != null);
+
+          // to keep the quorum peer running and force it to go into the looking state, we kill leader election
+          // and close the connection to the leader
+          servers.mt[falseLeader].main.quorumPeer.electionAlg.shutdown();
+          servers.mt[falseLeader].main.quorumPeer.follower.getSocket().close();
+
+          // wait for the falseLeader to disconnect
+          waitForOne(servers.zk[falseLeader], States.CONNECTING);
+
+          // convince falseLeader that it is the leader
+          servers.mt[falseLeader].main.quorumPeer.setPeerState(QuorumPeer.ServerState.LEADING);
+
+          // provide time for the falseleader to realize no followers have connected
+          // (this is twice the timeout used in Leader#getEpochToPropose)
+          Thread.sleep(2 * servers.mt[falseLeader].main.quorumPeer.initLimit * servers.mt[falseLeader].main.quorumPeer.tickTime);
+
+          // Restart leader election
+          servers.mt[falseLeader].main.quorumPeer.startLeaderElection();
+
+          // The previous client connection to falseLeader likely closed, create a new one
+          servers.zk[falseLeader] = new ZooKeeper("127.0.0.1:" + servers.mt[falseLeader].getClientPort(), ClientBase.CONNECTION_TIMEOUT, this);
+
+          // Wait for falseLeader to rejoin the quorum
+          waitForOne(servers.zk[falseLeader], States.CONNECTED);
+
+          // and ensure trueLeader is still the leader
+          Assert.assertTrue(servers.mt[trueLeader].main.quorumPeer.leader != null);
+
+          // Look through the logs for output that indicates the falseLeader is LEADING, then LOOKING, then FOLLOWING
+          LineNumberReader r = new LineNumberReader(new StringReader(os.toString()));
+          Pattern leading = Pattern.compile(".*myid=" + falseLeader + ".*LEADING.*");
+          Pattern looking = Pattern.compile(".*myid=" + falseLeader + ".*LOOKING.*");
+          Pattern following = Pattern.compile(".*myid=" + falseLeader + ".*FOLLOWING.*");
+
+          String line;
+          while ((line = r.readLine()) != null) {
+            if (!foundLeading) {
+              foundLeading = leading.matcher(line).matches();
+            } else if(!foundLooking) {
+              foundLooking = looking.matcher(line).matches();
+            } else if (following.matcher(line).matches()){
+              foundFollowing = true;
+              break;
+            }
+          }
+        } finally {
+          qlogger.removeAppender(appender);
+        }
+
+        Assert.assertTrue("falseLeader never attempts to become leader", foundLeading);
+        Assert.assertTrue("falseLeader never gives up on leadership", foundLooking);
+        Assert.assertTrue("falseLeader never rejoins the quorum", foundFollowing);
+    }
+
     private void waitForOne(ZooKeeper zk, States state) throws InterruptedException {
         int iterations = ClientBase.CONNECTION_TIMEOUT / 500;
         while (zk.getState() != state) {
             if (iterations-- == 0) {
-                throw new RuntimeException("Waiting too long");
+                throw new RuntimeException("Waiting too long " + zk.getState() + " != " + state);
             }
             Thread.sleep(500);
         }
+    }
+
+    private void waitForAll(Servers servers, States state) throws InterruptedException {
+        waitForAll(servers.zk, state);
     }
 
     private void waitForAll(ZooKeeper[] zks, States state) throws InterruptedException {
@@ -369,41 +456,79 @@ public class QuorumPeerMainTest extends QuorumPeerTestBase {
     private static class Servers {
         MainThread mt[];
         ZooKeeper zk[];
-    }
+        int[] clientPorts;
 
-    /**
-     * This is a helper function for launching a set of servers
-     *
-     * @param numServers
-     * @return
-     * @throws IOException
-     * @throws InterruptedException
-     */
-    private Servers LaunchServers(int numServers) throws IOException, InterruptedException {
-        int SERVER_COUNT = numServers;
-        Servers svrs = new Servers();
-        final int clientPorts[] = new int[SERVER_COUNT];
-        StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < SERVER_COUNT; i++) {
-            clientPorts[i] = PortAssignment.unique();
-            sb.append("server."+i+"=127.0.0.1:"+PortAssignment.unique()+":"+PortAssignment.unique()+";"+clientPorts[i]+"\n");
-        }
-        String quorumCfgSection = sb.toString();
-
-        MainThread mt[] = new MainThread[SERVER_COUNT];
-        ZooKeeper zk[] = new ZooKeeper[SERVER_COUNT];
-        for (int i = 0; i < SERVER_COUNT; i++) {
-            mt[i] = new MainThread(i, clientPorts[i], quorumCfgSection);
-            mt[i].start();
-            zk[i] = new ZooKeeper("127.0.0.1:" + clientPorts[i], ClientBase.CONNECTION_TIMEOUT, this);
+        public void shutDownAllServers() throws InterruptedException {
+            for (MainThread t: mt) {
+                t.shutdown();
+            }
         }
 
-        waitForAll(zk, States.CONNECTED);
+        public void restartAllServersAndClients(Watcher watcher) throws IOException {
+            for (MainThread t : mt) {
+                if (!t.isAlive()) {
+                    t.start();
+                }
+            }
+            for (int i = 0; i < zk.length; i++) {
+                restartClient(i, watcher);
+            }
+        }
 
-        svrs.mt = mt;
-        svrs.zk = zk;
-        return svrs;
+        public void restartClient(int clientIndex, Watcher watcher) throws IOException {
+            zk[clientIndex] = new ZooKeeper("127.0.0.1:" + clientPorts[clientIndex], ClientBase.CONNECTION_TIMEOUT, watcher);
+        }
+
+        public int findLeader() {
+            for (int i = 0; i < mt.length; i++) {
+                if (mt[i].main.quorumPeer.leader != null) {
+                    return i;
+                }
+            }
+            return -1;
+        }
     }
+
+
+  	private Servers LaunchServers(int numServers) throws IOException, InterruptedException {
+  	    return LaunchServers(numServers, null);
+    }
+
+    /** * This is a helper function for launching a set of servers
+  	 *
+  	 * @param numServers the number of servers
+     * @param tickTime A ticktime to pass to MainThread
+  	 * @return
+  	 * @throws IOException
+  	 * @throws InterruptedException
+  	 */
+  	private Servers LaunchServers(int numServers, Integer tickTime) throws IOException, InterruptedException {
+  	    int SERVER_COUNT = numServers;
+  	    Servers svrs = new Servers();
+  	    svrs.clientPorts = new int[SERVER_COUNT];
+  	    StringBuilder sb = new StringBuilder();
+  	    for(int i = 0; i < SERVER_COUNT; i++) {
+  	        svrs.clientPorts[i] = PortAssignment.unique();
+  	        sb.append("server."+i+"=127.0.0.1:"+PortAssignment.unique()+":"+PortAssignment.unique()+";"+svrs.clientPorts[i]+"\n");
+  	    }
+  	    String quorumCfgSection = sb.toString();
+
+  	    svrs.mt = new MainThread[SERVER_COUNT];
+        svrs.zk = new ZooKeeper[SERVER_COUNT];
+  	    for(int i = 0; i < SERVER_COUNT; i++) {
+  	        if (tickTime != null) {
+  	            svrs.mt[i] = new MainThread(i, svrs.clientPorts[i], quorumCfgSection, new HashMap<String, String>(), tickTime);
+            } else {
+  	            svrs.mt[i] = new MainThread(i, svrs.clientPorts[i], quorumCfgSection);
+            }
+            svrs.mt[i].start();
+  	        svrs.restartClient(i, this);
+  	    }
+
+  	    waitForAll(svrs, States.CONNECTED);
+
+  	    return svrs;
+  	}
 
     /**
      * Verify handling of bad quorum address
@@ -413,11 +538,8 @@ public class QuorumPeerMainTest extends QuorumPeerTestBase {
         ClientBase.setupTestEnv();
 
         // setup the logger to capture all logs
-        Layout layout =
-                Logger.getRootLogger().getAppender("CONSOLE").getLayout();
         ByteArrayOutputStream os = new ByteArrayOutputStream();
-        WriterAppender appender = new WriterAppender(layout, os);
-        appender.setThreshold(Level.WARN);
+        WriterAppender appender = getConsoleAppender(os, Level.WARN);
         Logger qlogger = Logger.getLogger("org.apache.zookeeper.server.quorum");
         qlogger.addAppender(appender);
 
@@ -472,11 +594,8 @@ public class QuorumPeerMainTest extends QuorumPeerTestBase {
         ClientBase.setupTestEnv();
 
         // setup the logger to capture all logs
-        Layout layout =
-                Logger.getRootLogger().getAppender("CONSOLE").getLayout();
         ByteArrayOutputStream os = new ByteArrayOutputStream();
-        WriterAppender appender = new WriterAppender(layout, os);
-        appender.setThreshold(Level.INFO);
+        WriterAppender appender = getConsoleAppender(os, Level.INFO);
         Logger qlogger = Logger.getLogger("org.apache.zookeeper.server.quorum");
         qlogger.addAppender(appender);
 
@@ -569,7 +688,7 @@ public class QuorumPeerMainTest extends QuorumPeerTestBase {
             + ":" + electionPort1 + ";" + CLIENT_PORT_QP1
             + "\nserver.2=127.0.0.1:" + PortAssignment.unique()
             + ":" +  electionPort2 + ";" + CLIENT_PORT_QP2;
-        
+
         MainThread q1 = new MainThread(1, CLIENT_PORT_QP1, quorumCfgSection);
         MainThread q2 = new MainThread(2, CLIENT_PORT_QP2, quorumCfgSection);
         q1.start();
@@ -615,12 +734,9 @@ public class QuorumPeerMainTest extends QuorumPeerTestBase {
         ClientBase.setupTestEnv();
 
         // setup the logger to capture all logs
-        Layout layout =
-                Logger.getRootLogger().getAppender("CONSOLE").getLayout();
         ByteArrayOutputStream os = new ByteArrayOutputStream();
-        WriterAppender appender = new WriterAppender(layout, os);
+        WriterAppender appender = getConsoleAppender(os, Level.INFO);
         appender.setImmediateFlush(true);
-        appender.setThreshold(Level.INFO);
         Logger zlogger = Logger.getLogger("org.apache.zookeeper");
         zlogger.addAppender(appender);
 
@@ -784,4 +900,220 @@ public class QuorumPeerMainTest extends QuorumPeerTestBase {
                 maxSessionTimeOut, quorumPeer.getMaxSessionTimeout());
     }
 
+    @Test
+    public void testFailedTxnAsPartOfQuorumLoss() throws Exception {
+        final int LEADER_TIMEOUT_MS = 10_000;
+        // 1. start up server and wait for leader election to finish
+        ClientBase.setupTestEnv();
+        final int SERVER_COUNT = 3;
+        servers = LaunchServers(SERVER_COUNT);
+
+        waitForAll(servers, States.CONNECTED);
+
+        // we need to shutdown and start back up to make sure that the create session isn't the first transaction since
+        // that is rather innocuous.
+        servers.shutDownAllServers();
+        waitForAll(servers, States.CONNECTING);
+        servers.restartAllServersAndClients(this);
+        waitForAll(servers, States.CONNECTED);
+
+        // 2. kill all followers
+        int leader = servers.findLeader();
+        Map<Long, Proposal> outstanding =  servers.mt[leader].main.quorumPeer.leader.outstandingProposals;
+        // increase the tick time to delay the leader going to looking
+        servers.mt[leader].main.quorumPeer.tickTime = LEADER_TIMEOUT_MS;
+        LOG.warn("LEADER {}", leader);
+
+        for (int i = 0; i < SERVER_COUNT; i++) {
+            if (i != leader) {
+                servers.mt[i].shutdown();
+            }
+        }
+
+        // 3. start up the followers to form a new quorum
+        for (int i = 0; i < SERVER_COUNT; i++) {
+            if (i != leader) {
+                servers.mt[i].start();
+            }
+        }
+
+        // 4. wait one of the follower to be the new leader
+        for (int i = 0; i < SERVER_COUNT; i++) {
+            if (i != leader) {
+                // Recreate a client session since the previous session was not persisted.
+                servers.restartClient(i, this);
+                waitForOne(servers.zk[i], States.CONNECTED);
+            }
+        }
+
+        // 5. send a create request to old leader and make sure it's synced to disk,
+        //    which means it acked from itself
+        try {
+            servers.zk[leader].create("/zk" + leader, "zk".getBytes(), Ids.OPEN_ACL_UNSAFE,
+                CreateMode.PERSISTENT);
+            Assert.fail("create /zk" + leader + " should have failed");
+        } catch (KeeperException e) {
+        }
+
+        // just make sure that we actually did get it in process at the
+        // leader
+        Assert.assertEquals(1, outstanding.size());
+        Proposal p = outstanding.values().iterator().next();
+        Assert.assertEquals(OpCode.create, p.request.getHdr().getType());
+
+        // make sure it has a chance to write it to disk
+        int sleepTime = 0;
+        Long longLeader = new Long(leader);
+        while (!p.qvAcksetPairs.get(0).getAckset().contains(longLeader)) {
+            if (sleepTime > 2000) {
+                Assert.fail("Transaction not synced to disk within 1 second " + p.qvAcksetPairs.get(0).getAckset()
+                    + " expected " + leader);
+            }
+            Thread.sleep(100);
+            sleepTime += 100;
+        }
+
+        // 6. wait for the leader to quit due to not enough followers and come back up as a part of the new quorum
+        LOG.info("Waiting for leader {} to timeout followers", leader);
+        sleepTime = 0;
+        Follower f = servers.mt[leader].main.quorumPeer.follower;
+        while (f == null || !f.isRunning()) {
+            if (sleepTime > LEADER_TIMEOUT_MS * 2) {
+                Assert.fail("Took too long for old leader to time out " + servers.mt[leader].main.quorumPeer.getPeerState());
+            }
+            Thread.sleep(100);
+            sleepTime += 100;
+            f = servers.mt[leader].main.quorumPeer.follower;
+        }
+
+        int newLeader = servers.findLeader();
+        // make sure a different leader was elected
+        Assert.assertNotEquals(leader, newLeader);
+
+        // 7. restart the previous leader to force it to replay the edits and possibly come up in a bad state
+        servers.mt[leader].shutdown();
+        servers.mt[leader].start();
+        waitForAll(servers, States.CONNECTED);
+
+        // 8. check the node exist in previous leader but not others
+        //    make sure everything is consistent
+        for (int i = 0; i < SERVER_COUNT; i++) {
+            Assert.assertNull("server " + i + " should not have /zk" + leader, servers.zk[i].exists("/zk" + leader, false));
+        }
+    }
+
+    /**
+     * Verify that a node without the leader in its view will not attempt to connect to the leader.
+     */
+    @Test
+    public void testLeaderOutOfView() throws Exception {
+        ClientBase.setupTestEnv();
+
+        int numServers = 3;
+
+        // used for assertions later
+        boolean foundLeading = false;
+        boolean foundFollowing = false;
+
+        // capture QuorumPeer logging
+        ByteArrayOutputStream os = new ByteArrayOutputStream();
+        WriterAppender appender = getConsoleAppender(os, Level.DEBUG);
+        Logger qlogger = Logger.getLogger("org.apache.zookeeper.server.quorum");
+        qlogger.addAppender(appender);
+
+        try {
+            Servers svrs = new Servers();
+            svrs.clientPorts = new int[numServers];
+            for (int i = 0; i < numServers; i++) {
+                svrs.clientPorts[i] = PortAssignment.unique();
+            }
+
+            String quorumCfgIncomplete = getUniquePortCfgForId(1) + "\n" + getUniquePortCfgForId(2);
+            String quorumCfgComplete = quorumCfgIncomplete + "\n" + getUniquePortCfgForId(3);
+            svrs.mt = new MainThread[3];
+
+            // Node 1 is started without the leader (3) in its config view
+            svrs.mt[0] = new MainThread(1, svrs.clientPorts[0], quorumCfgIncomplete);
+            for (int i = 1; i < numServers; i++) {
+                svrs.mt[i] = new MainThread(i + 1, svrs.clientPorts[i], quorumCfgComplete);
+            }
+
+            // Node 1 must be started first, before quorum is formed, to trigger the attempted invalid connection to 3
+            svrs.mt[0].start();
+            QuorumPeer quorumPeer1 = waitForQuorumPeer(svrs.mt[0], CONNECTION_TIMEOUT);
+            Assert.assertTrue(quorumPeer1.getPeerState() == QuorumPeer.ServerState.LOOKING);
+
+            // Node 3 started second to avoid 1 and 2 forming a quorum before 3 starts up
+            int highestServerIndex = numServers - 1;
+            svrs.mt[highestServerIndex].start();
+            QuorumPeer quorumPeer3 = waitForQuorumPeer(svrs.mt[highestServerIndex], CONNECTION_TIMEOUT);
+            Assert.assertTrue(quorumPeer3.getPeerState() == QuorumPeer.ServerState.LOOKING);
+
+            // Node 2 started last, kicks off leader election
+            for (int i = 1; i < highestServerIndex; i++) {
+                svrs.mt[i].start();
+            }
+
+            // Nodes 2 and 3 now form quorum and fully start. 1 attempts to vote for 3, fails, returns to LOOKING state
+            for (int i = 1; i < numServers; i++) {
+                Assert.assertTrue("waiting for server to start",
+                        ClientBase.waitForServerUp("127.0.0.1:" + svrs.clientPorts[i], CONNECTION_TIMEOUT));
+            }
+
+            Assert.assertTrue(svrs.mt[0].getQuorumPeer().getPeerState() == QuorumPeer.ServerState.LOOKING);
+            Assert.assertTrue(svrs.mt[highestServerIndex].getQuorumPeer().getPeerState() == QuorumPeer.ServerState.LEADING);
+            for (int i = 1; i < highestServerIndex; i++) {
+                Assert.assertTrue(svrs.mt[i].getQuorumPeer().getPeerState() == QuorumPeer.ServerState.FOLLOWING);
+            }
+
+            // Look through the logs for output that indicates Node 1 is LEADING or FOLLOWING
+            LineNumberReader r = new LineNumberReader(new StringReader(os.toString()));
+            Pattern leading = Pattern.compile(".*myid=1.*QuorumPeer.*LEADING.*");
+            Pattern following = Pattern.compile(".*myid=1.*QuorumPeer.*FOLLOWING.*");
+
+            String line;
+            while ((line = r.readLine()) != null && !foundLeading && !foundFollowing) {
+                foundLeading = leading.matcher(line).matches();
+                foundFollowing = following.matcher(line).matches();
+            }
+
+        } finally {
+            qlogger.removeAppender(appender);
+        }
+
+        Assert.assertFalse("Corrupt peer should never become leader", foundLeading);
+        Assert.assertFalse("Corrupt peer should not attempt connection to out of view leader", foundFollowing);
+    }
+
+    private WriterAppender getConsoleAppender(ByteArrayOutputStream os, Level level) {
+        String loggingPattern = ((PatternLayout) Logger.getRootLogger().getAppender("CONSOLE").getLayout()).getConversionPattern();
+        WriterAppender appender = new WriterAppender(new PatternLayout(loggingPattern), os);
+        appender.setThreshold(level);
+        return appender;
+    }
+
+    private String getUniquePortCfgForId(int id) {
+        return String.format("server.%d=127.0.0.1:%d:%d", id, PortAssignment.unique(), PortAssignment.unique());
+    }
+
+    private QuorumPeer waitForQuorumPeer(MainThread mainThread, int timeout) throws TimeoutException {
+        long start = Time.currentElapsedTime();
+        while (true) {
+            QuorumPeer quorumPeer = mainThread.isAlive() ? mainThread.getQuorumPeer() : null;
+            if (quorumPeer != null) {
+                return quorumPeer;
+            }
+
+            if (Time.currentElapsedTime() > start + timeout) {
+                LOG.error("Timed out while waiting for QuorumPeer");
+                throw new TimeoutException();
+            }
+
+            try {
+                Thread.sleep(250);
+            } catch (InterruptedException e) {
+                // ignore
+            }
+        }
+    }
 }
